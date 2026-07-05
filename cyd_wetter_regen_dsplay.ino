@@ -1,0 +1,409 @@
+// =========================================================================
+// DWD DISPLAY & IOBROKER - WEATHER & TANK FILL LEVEL CALIBRATION (V7.7)
+// =========================================================================
+
+#include <Arduino.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <lvgl.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <math.h>
+#include <ArduinoJson.h>
+#include <RTClib.h>
+#include <esp32-hal-ledc.h>
+#include <PNGdec.h> 
+
+// === ZEIT-INTERVALLE ===
+#define DATA_UPDATE_TIME 60000UL       
+#define SCREEN_SWITCH_TIME 20000UL     
+#define BRIGHTNESS_UPDATE_TIME 10000UL 
+#define SCREEN_MINIMUM_BRIGHTNESS 10   
+
+// === HARDWARE CONFIG (CYD) ===
+#define XPT2046_IRQ 36   
+#define XPT2046_MOSI 32  
+#define XPT2046_MISO 39  
+#define XPT2046_CLK 25   
+#define XPT2046_CS 33    
+#define LCD_BACKLIGHT_PIN 21
+
+#define SCREEN_WIDTH 240
+#define SCREEN_HEIGHT 320
+#define DEFAULT_CAPTIVE_SSID "WetterDisplay_Setup"
+#define DRAW_BUF_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 20 * (LV_COLOR_DEPTH / 8))
+
+// === GLOBALE HARDWARE-INSTANZEN ===
+SPIClass touchscreenSPI = SPIClass(VSPI);
+XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
+TFT_eSPI tft = TFT_eSPI(); 
+PNG png; 
+
+int freq = 5000;
+int ledChannel = 0;
+int resolution = 8;
+int brightness = 255; 
+
+uint32_t draw_buf[DRAW_BUF_SIZE / 4];
+int x, y, z;
+
+// =========================================================================
+// CONFIGURATION
+// =========================================================================
+const String ioBroker_IP = "192.168.69.184"; 
+
+const String tempURL      = "http://" + ioBroker_IP + ":8082/state/mqtt.0.weather.outTemp_C";
+const String windURL      = "http://" + ioBroker_IP + ":8082/state/mqtt.0.weather.windSpeed_mps";
+const String radarURL     = "http://" + ioBroker_IP + ":8082/0_userdata.0/wetterdisplay/radar.png";
+
+// === NEU: Deine Zisternen-URLs ===
+const String tankairURL   = "http://" + ioBroker_IP + ":8082/state/mqtt.0.weather.tank_air";
+const String tankdepthURL = "http://" + ioBroker_IP + ":8082/state/mqtt.0.weather.tank_depth";
+
+bool showRadarMode = false;
+unsigned long lastScreenSwitch = 0;
+
+// LVGL UI-Objekte
+lv_obj_t * temp_label;
+lv_obj_t * wind_label;
+lv_obj_t * tank_label; // NEU: Zisternen Label
+lv_obj_t * title_label;
+lv_obj_t * url_label;
+
+// Callback für den PNG-Decoder
+int pngDraw(PNGDRAW *pDraw) {
+  uint16_t usPixels[320]; 
+  if (pDraw->y >= tft.height()) return 1;
+  
+  int drawWidth = pDraw->iWidth;
+  if (drawWidth > 320) drawWidth = 320;
+
+  png.getLineAsRGB565(pDraw, usPixels, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+  
+  int xOffset = (tft.width() - drawWidth) / 2;
+  int yOffset = (tft.height() - png.getHeight()) / 2;
+  if (xOffset < 0) xOffset = 0;
+  if (yOffset < 0) yOffset = 0;
+
+  tft.pushImage(xOffset, yOffset + pDraw->y, drawWidth, 1, usPixels);
+  return 1;
+}
+
+// =========================================================================
+// ÄNDERUNG IN DER FUNKTION: draw_radar_image (Zwingt zum Live-Update)
+// =========================================================================
+void draw_radar_image(String image_url) {
+  image_url.replace("\"", "");
+  image_url.trim();
+
+  if (image_url.length() < 10 || image_url.startsWith("<")) return; 
+  if (image_url.startsWith("/")) {
+    image_url = "http://" + ioBroker_IP + ":8082" + image_url; 
+  }
+
+  // === TRICK: CACHE-BUSTER ANHÄNGEN ===
+  // Hängt ?t=SYSTEMZEIT an. ioBroker MUSS dadurch das Bild jedes Mal frisch senden!
+  String finalUrl = image_url + "?t=" + String(millis());
+
+  Serial.println("Lade Bild von URL: " + finalUrl);
+
+  HTTPClient http;
+  http.begin(finalUrl); 
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    size_t max_buffer_size = 92160; 
+    uint8_t* temp_buffer = (uint8_t*)malloc(max_buffer_size);
+    if (temp_buffer == NULL) {
+      Serial.println("Fehler: Temporaerer RAM-Puffer voll!");
+      http.end();
+      return;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    stream->setTimeout(3000); 
+    
+    int bytesRead = stream->readBytes(temp_buffer, max_buffer_size);
+    http.end(); 
+    
+    Serial.printf("Download beendet. %d Bytes empfangen. Starte Decoder...\n", bytesRead);
+
+    tft.fillScreen(0x1a243a); 
+
+    int rc = png.openRAM(temp_buffer, bytesRead, pngDraw);
+    if (rc == PNG_SUCCESS) {
+      png.decode(NULL, 0);      
+      Serial.println("Radarbild erfolgreich gezeichnet!");
+    } else {
+      Serial.printf("PNG-Decoder Fehler Code: %d\n", rc);
+    }
+    free(temp_buffer); 
+  } else {
+    Serial.printf("Bild-Download HTTP Fehler: %d\n", httpCode);
+    http.end();
+  }
+}
+
+// Holt alle Wetterdaten und berechnet den Tankfüllstand
+void get_iobroker_weather_data() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    float tankAir = -1.0;
+    float tankDepth = -1.0;
+
+    // 1. Temperatur
+    http.begin(tempURL);
+    if (http.GET() == HTTP_CODE_OK) {
+      String payload = http.getString();
+      payload.replace("\"", ""); payload.trim();
+      if (!payload.startsWith("<")) {
+        float tempVal = payload.toFloat();
+        lv_label_set_text_fmt(temp_label, "Temperatur: %.1f Grad", tempVal);
+      }
+    }
+    http.end();
+
+    // 2. Windgeschwindigkeit
+    http.begin(windURL);
+    if (http.GET() == HTTP_CODE_OK) {
+      String payload = http.getString();
+      payload.replace("\"", ""); payload.trim();
+      if (!payload.startsWith("<")) {
+        float windVal = payload.toFloat();
+        lv_label_set_text_fmt(wind_label, "Wind: %.1f m/s", windVal);
+      }
+    }
+    http.end();
+
+    // 3. Tank Air abfragen (Freier Raum oben im Tank)
+    http.begin(tankairURL);
+    if (http.GET() == HTTP_CODE_OK) {
+      String payload = http.getString();
+      payload.replace("\"", ""); payload.trim();
+      if (!payload.startsWith("<")) {
+        tankAir = payload.toFloat();
+      }
+    }
+    http.end();
+
+    // 4. Tank Depth abfragen (Gesamttiefe des Tanks)
+    http.begin(tankdepthURL);
+    if (http.GET() == HTTP_CODE_OK) {
+      String payload = http.getString();
+      payload.replace("\"", ""); payload.trim();
+      if (!payload.startsWith("<")) {
+        tankDepth = payload.toFloat();
+      }
+    }
+    http.end();
+
+    // === TANK-BERECHNUNG & KALIBRIERUNGSHILFE ===
+    if (tankAir >= 0 && tankDepth > 0) {
+      // Berechnung: Wasserhöhe = Gesamttiefe - Luftraum oben
+      float waterHeight = tankDepth - tankAir;
+      
+      // Prozentuale Berechnung
+      float fillPercent = (waterHeight / tankDepth) * 100.0;
+      
+      // Sicherheits-Begrenzung zwischen 0% und 100%
+      if (fillPercent < 0.0) fillPercent = 0.0;
+      if (fillPercent > 100.0) fillPercent = 100.0;
+
+      // Ausgabe im Seriellen Monitor für deinen Praxisversuch
+      Serial.printf("Tank Live-Check -> Luft (Air): %.1f | Tiefe (Depth): %.1f -> Wasserhoehe: %.1f cm -> Fuellstand: %.1f%%\n", 
+                    tankAir, tankDepth, waterHeight, fillPercent);
+
+      // Auf dem Display anzeigen
+      lv_label_set_text_fmt(tank_label, "Zisterne: %.1f %%", fillPercent);
+    } else {
+      // Falls Werte unvollständig sind, Rohwerte im Monitor zeigen zur Fehlersuche
+      Serial.printf("Tank-Fehler oder noch nicht kalibriert! Air: %.1f, Depth: %.1f\n", tankAir, tankDepth);
+      lv_label_set_text(tank_label, "Zisterne: Lade Daten...");
+    }
+  }
+}
+
+void update_radar_now() {
+  draw_radar_image(radarURL);
+}
+
+void flush_wifi_splashscreen(uint32_t ms = 200) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    lv_timer_handler();
+    delay(5);
+  }
+}
+
+void wifi_splash_screen() {
+  lv_obj_t *scr = lv_scr_act();
+  lv_obj_clean(scr);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x4c8cb9), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0xa6cdec), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+  lv_obj_t *lbl = lv_label_create(scr);
+  lv_label_set_text(lbl,
+                    "Wetter-Display Wi-Fi Setup:\n\n"
+                    "Bitte mit dem WLAN verbinden:\n"
+                    DEFAULT_CAPTIVE_SSID
+                    "\n\n"
+                    "Falls sich kein Fenster oeffnet:\n"
+                    "http://192.168.4.1 im Browser aufrufen.");
+  lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(lbl);
+  lv_scr_load(scr);
+}
+
+void apModeCallback(WiFiManager *mgr) {
+  wifi_splash_screen();
+  flush_wifi_splashscreen();
+}
+
+void touchscreen_read(lv_indev_t *indev, lv_indev_data_t *data) {
+  if (touchscreen.tirqTouched() && touchscreen.touched()) {
+    TS_Point p = touchscreen.getPoint();
+    x = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
+    y = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
+    z = p.z;
+    data->state = LV_INDEV_STATE_PRESSED;
+    data->point.x = x;
+    data->point.y = y;
+    brightness = 255;
+    ledcWrite(LCD_BACKLIGHT_PIN, brightness);
+  } else {
+    data->state = LV_INDEV_STATE_RELEASED;
+  }
+}
+
+void log_print(lv_log_level_t level, const char * buf) {
+  LV_UNUSED(level);
+  Serial.println(buf);
+  Serial.flush();
+}
+
+// === ARDUINO SETUP ===
+void setup() {
+  Serial.begin(115200);
+
+  tft.init(); 
+  tft.setRotation(1); 
+  ledcAttach(LCD_BACKLIGHT_PIN, freq, resolution);
+  ledcWrite(LCD_BACKLIGHT_PIN, brightness); 
+  delay(10);
+
+  lv_init();
+  lv_log_register_print_cb(log_print);
+
+  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  touchscreen.begin(touchscreenSPI);
+  touchscreen.setRotation(90);  
+
+  lv_display_t * disp = lv_tft_espi_create(SCREEN_WIDTH, SCREEN_HEIGHT, draw_buf, sizeof(draw_buf));
+  lv_indev_t *indev = lv_indev_create();
+  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(indev, touchscreen_read);
+  lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
+
+  WiFiManager wifiManager;
+  wifiManager.setAPCallback(apModeCallback);
+  wifiManager.autoConnect(DEFAULT_CAPTIVE_SSID);
+
+  lv_obj_clean(lv_scr_act());
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0A1128), LV_PART_MAIN); 
+
+// =========================================================================
+// [INNERHALB VON VOID SETUP()] - UI INITIALISIERUNG UPDATE V7.7.1
+// =========================================================================
+
+// ... [Der Teil mit lv_init(), TFT init, Touchscreen init bleibt gleich] ...
+
+  // UI-Objekte erzeugen (Bevor wir Stile zuweisen!)
+  title_label = lv_label_create(lv_screen_active());
+  temp_label  = lv_label_create(lv_screen_active());
+  wind_label  = lv_label_create(lv_screen_active());
+  tank_label  = lv_label_create(lv_screen_active());
+  url_label   = lv_label_create(lv_screen_active());
+
+  lv_label_set_text(title_label, "Shelly Wetterstation");
+  lv_label_set_text(url_label, "wetter.ringelberger.de");
+  
+  // Grundfarben setzen
+  lv_obj_set_style_text_color(title_label, lv_color_hex(0x00A8E8), LV_PART_MAIN); 
+  lv_obj_set_style_text_color(temp_label,  lv_color_hex(0xFFFFFF), LV_PART_MAIN);  
+  lv_obj_set_style_text_color(wind_label,  lv_color_hex(0xFFFFFF), LV_PART_MAIN);  
+  lv_obj_set_style_text_color(tank_label,  lv_color_hex(0x3498DB), LV_PART_MAIN); // Wasser-Blau
+  lv_obj_set_style_text_color(url_label,   lv_color_hex(0xEE7600), LV_PART_MAIN); 
+
+  // === NEU: SCHRIFTGRÖSSE ANPASSEN ===
+  // Wir erstellen einen Stil für große Daten-Texte.
+  // Standard ist oft font_14. Wir nutzen font_20 für deutliche Vergrößerung.
+  // (font_24 wäre noch größer, könnte aber Platzprobleme machen bei 4 Zeilen).
+  static lv_style_t style_large_text;
+  lv_style_init(&style_large_text);
+  lv_style_set_text_font(&style_large_text, &lv_font_montserrat_20); // <-- ÄNDERE DIESE ZAHL FÜR ANDERE GRÖSSEN
+
+  // Wende den großen Stil auf die Daten-Labels an (Titel bleibt klein/mittel)
+  lv_obj_add_style(temp_label, &style_large_text, LV_PART_MAIN);
+  lv_obj_add_style(wind_label, &style_large_text, LV_PART_MAIN);
+  lv_obj_add_style(tank_label, &style_large_text, LV_PART_MAIN);
+
+  // === UI LAYOUT JUSTIERUNG - NACH OBEN SKALIERT & VERGRÖSSERT ===
+  // Die Y-Offsets wurden deutlich verkleinert (kleinere Zahl = höher).
+  // Durch die größere Schrift brauchen wir mehr vertikalen Platz zwischen den Zeilen.
+  // Abstand jetzt ca. 45-50 Pixel statt 50, da die Schrift selbst höher ist.
+
+  lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 10);  // Titel ganz oben bei Y=10 (vorher 15)
+  lv_obj_align(temp_label,  LV_ALIGN_TOP_MID, 0, 50);  // Temperatur bei Y=50 (vorher 65)
+  lv_obj_align(wind_label,  LV_ALIGN_TOP_MID, 0, 95);  // Wind bei Y=95 (vorher 115)
+  lv_obj_align(tank_label,  LV_ALIGN_TOP_MID, 0, 140); // Zisterne bei Y=140 (vorher 165)
+  lv_obj_align(url_label,   LV_ALIGN_TOP_MID, 0, 180); // url ganz unten
+
+// ... [Der Rest von setup() mit screen_clear_flag, get_data() etc. bleibt gleich] ...
+
+  lv_obj_t * screen = lv_scr_act(); 
+  lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE); 
+
+  get_iobroker_weather_data();
+  lastScreenSwitch = millis();
+}
+
+// === ARDUINO LOOP ===
+void loop() {
+  static uint32_t lastDataUpdate = millis();
+  static uint32_t last_brightness = millis();
+
+  if (millis() - lastDataUpdate >= DATA_UPDATE_TIME) {
+    get_iobroker_weather_data();
+    lastDataUpdate = millis();
+  }
+
+  if (millis() - lastScreenSwitch >= SCREEN_SWITCH_TIME) {
+    showRadarMode = !showRadarMode; 
+    lastScreenSwitch = millis();
+
+    if (showRadarMode) {
+      Serial.println("Wechsle zu: Fullscreen Radarbild");
+      update_radar_now(); 
+    } else {
+      Serial.println("Wechsle zu: Wetterdaten Text");
+      tft.fillScreen(0x0A1128); 
+      lv_obj_invalidate(lv_scr_act()); 
+    }
+  }
+
+  if (!showRadarMode) {
+    lv_timer_handler();
+  }
+  
+  if (millis() - last_brightness >= BRIGHTNESS_UPDATE_TIME) {
+    brightness -= 10;
+    if (brightness < SCREEN_MINIMUM_BRIGHTNESS) brightness = SCREEN_MINIMUM_BRIGHTNESS;
+    ledcWrite(LCD_BACKLIGHT_PIN, brightness);
+    last_brightness = millis();
+  }
+  
+  lv_tick_inc(5);
+  delay(5);
+}
